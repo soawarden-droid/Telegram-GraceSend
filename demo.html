@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Grace Send — playable demo</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { background: #0e1621; color: #fff; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 18px 10px 30px; }
+  h1 { font-size: 20px; margin-bottom: 4px; } h1 .t { color: #7cc4ff; }
+  .sub { color: #8ea3b5; font-size: 13px; margin-bottom: 14px; text-align: center; max-width: 380px; line-height: 1.5; }
+  .phone { width: 360px; max-width: 94vw; background: #17212b; border-radius: 26px; overflow: hidden; box-shadow: 0 18px 50px rgba(0,0,0,.55); border: 1px solid #2b3b4c; }
+  .header { background: #242f3d; padding: 12px 14px; display: flex; align-items: center; gap: 10px; }
+  .avatar { width: 40px; height: 40px; border-radius: 50%; background: linear-gradient(135deg,#7b4b9e,#4b7bb5); display: flex; align-items: center; justify-content: center; font-weight: 700; }
+  .hname { font-weight: 600; font-size: 15px; } .hstatus { color: #8ea3b5; font-size: 12px; }
+  .toggle { margin-left: auto; display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: #a9bfd2; }
+  .switch { width: 38px; height: 22px; border-radius: 999px; background: #2e7d4f; position: relative; cursor: pointer; border: none; }
+  .switch::after { content: ""; position: absolute; top: 3px; left: 19px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: left .15s; }
+  .switch.off { background: #44566b; } .switch.off::after { left: 3px; }
+  .chat { height: 300px; padding: 14px; overflow-y: auto; background: radial-gradient(1200px 500px at 70% -10%, #1d2f45 0%, #17212b 55%); display: flex; flex-direction: column; gap: 8px; }
+  .msg { max-width: 78%; padding: 8px 12px; border-radius: 14px; font-size: 14px; line-height: 1.35; }
+  .in { background: #182533; align-self: flex-start; border-bottom-left-radius: 4px; }
+  .out { background: #2b5278; align-self: flex-end; border-bottom-right-radius: 4px; }
+  .bar { display: none; align-items: center; gap: 10px; background: #20344a; border-top: 1px solid #33506e; padding: 10px 14px; font-size: 13.5px; }
+  .bar .clock { color: #7cc4ff; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .bar .track { flex: 1; height: 4px; background: #16222f; border-radius: 999px; overflow: hidden; }
+  .bar .fill { height: 100%; background: #5288c1; width: 100%; }
+  .bar button { background: none; border: none; color: #ffd75e; font-weight: 700; font-size: 13.5px; cursor: pointer; padding: 2px 4px; }
+  .composer { display: flex; gap: 8px; padding: 10px; background: #17212b; border-top: 1px solid #242f3d; }
+  .composer input { flex: 1; background: #242f3d; border: none; border-radius: 999px; color: #fff; padding: 10px 14px; font-size: 14px; outline: none; }
+  .sendbtn { background: #5288c1; border: none; color: #fff; width: 42px; height: 42px; border-radius: 50%; font-size: 17px; cursor: pointer; }
+  .note { color: #8ea3b5; font-size: 12px; text-align: center; margin-top: 12px; max-width: 380px; line-height: 1.5; }
+  .toast { min-height: 20px; color: #ffd75e; font-size: 13px; margin-top: 10px; text-align: center; }
+</style>
+</head>
+<body>
+<h1>⏳ <span class="t">Grace Send</span></h1>
+<p class="sub">A playable demo of the ADIN feature patch for Telegram Android. Type something, hit send — then change your mind within 10 seconds.</p>
+
+<div class="phone">
+  <div class="header">
+    <div class="avatar">A</div>
+    <div><div class="hname">Alex</div><div class="hstatus">online</div></div>
+    <div class="toggle">Grace Send <button class="switch" id="switch" onclick="flip()"></button></div>
+  </div>
+  <div class="chat" id="chat">
+    <div class="msg in">did you send the report?</div>
+    <div class="msg out">almost. one sec</div>
+  </div>
+  <div class="bar" id="bar">
+    <span>⏳ Sending in <span class="clock" id="clock">0:10</span></span>
+    <div class="track"><div class="fill" id="fill"></div></div>
+    <button onclick="undo()">UNDO</button>
+  </div>
+  <div class="composer">
+    <input id="input" placeholder="Message" onkeydown="if(event.key==='Enter')trySend()">
+    <button class="sendbtn" onclick="trySend()">➤</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<p class="note">Demo of the design — no real Telegram account, nothing leaves this page. In the real patch the toggle lives in Settings → Chat Settings, and voice/media messages are never delayed.</p>
+
+<script>
+  let on = true, timer = null, left = 0, held = "";
+  const $ = id => document.getElementById(id);
+  function flip(){ on = !on; $('switch').classList.toggle('off', !on); toast(on ? 'Grace Send is ON — sends wait 10 seconds.' : 'Grace Send is OFF — sends go instantly.'); }
+  function toast(t){ $('toast').textContent = t; }
+  function addMsg(text){ const d = document.createElement('div'); d.className = 'msg out'; d.textContent = text; $('chat').appendChild(d); $('chat').scrollTop = 1e6; }
+  function trySend(){
+    const v = $('input').value.trim(); if(!v) return;
+    if(timer){ toast('One message is already waiting — Undo it or let it go.'); return; }
+    if(!on){ addMsg(v); $('input').value = ''; return; }
+    held = v; $('input').value = ''; left = 100; $('bar').style.display = 'flex'; tick();
+    timer = setInterval(() => { left--; tick(); if(left <= 0){ finish(); } }, 100);
+  }
+  function tick(){ const s = Math.ceil(left / 10); $('clock').textContent = '0:' + String(s).padStart(2, '0'); $('fill').style.width = left + '%'; }
+  function finish(){ clearInterval(timer); timer = null; $('bar').style.display = 'none'; addMsg(held); toast('Sent. This time you meant it.'); held = ''; }
+  function undo(){ if(!timer) return; clearInterval(timer); timer = null; $('bar').style.display = 'none'; $('input').value = held; $('input').focus(); toast('↩️ Cancelled — nothing was sent. Your words are back in the box.'); held = ''; }
+</script>
+</body>
+</html>

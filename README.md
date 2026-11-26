@@ -15,6 +15,21 @@ exactly as you typed it. Nothing was sent, nothing to delete, nobody saw
 anything. Do nothing, and at zero the message goes out through Telegram's
 normal send path, unchanged.
 
+## Screenshots
+
+Design mockups of the two screens the patch adds (the patch is not
+compiled yet — see Status):
+
+![The countdown bar above the composer](screenshot-countdown.png)
+
+![The Grace Send toggle in Chat Settings](screenshot-settings.png)
+
+## Try the demo
+
+A playable mock of the whole flow lives in [`demo.html`](demo.html) —
+download it and open it in any browser. Type a message, hit send, and
+change your mind within the 10 seconds.
+
 ## What it does
 
 ### 1. Sending
