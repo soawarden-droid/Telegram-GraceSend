@@ -1,0 +1,457 @@
+diff --git a/TMessagesProj/src/main/java/org/telegram/messenger/GraceSend.java b/TMessagesProj/src/main/java/org/telegram/messenger/GraceSend.java
+new file mode 100644
+index 0000000..8aa4b93
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/messenger/GraceSend.java
+@@ -0,0 +1,193 @@
++/*
++ * Grace Send — a 10-second undo window before a message truly leaves.
++ *
++ * Part of a small feature patch for Telegram for Android.
++ * Written for this patch; not part of the upstream project.
++ *
++ * How it works: when the user presses Send in a chat, ChatActivityEnterView
++ * builds the usual SendMessagesHelper.SendMessageParams but, instead of
++ * dispatching them at once, hands them to hold(). The params are kept here,
++ * untouched, for DELAY_SECONDS. A countdown bar above the composer offers
++ * Undo. On expiry the params are passed to the normal send path, unchanged.
++ * On Undo the params are dropped — nothing ever left the phone — and the
++ * original text is given back to the composer.
++ */
++package org.telegram.messenger;
++
++import android.os.SystemClock;
++import android.text.SpannableStringBuilder;
++
++import java.lang.ref.WeakReference;
++import java.util.ArrayList;
++import java.util.Iterator;
++
++public class GraceSend {
++
++    public static final int DELAY_SECONDS = 10;
++    public static final String PREF_KEY = "grace_send";
++
++    private static volatile GraceSend[] Instance = new GraceSend[UserConfig.MAX_ACCOUNT_COUNT];
++
++    public static GraceSend getInstance(int num) {
++        GraceSend localInstance = Instance[num];
++        if (localInstance == null) {
++            synchronized (GraceSend.class) {
++                localInstance = Instance[num];
++                if (localInstance == null) {
++                    Instance[num] = localInstance = new GraceSend(num);
++                }
++            }
++        }
++        return localInstance;
++    }
++
++    public interface Listener {
++        void onGraceSendChanged(long dialogId);
++
++        void onGraceSendUndo(long dialogId, CharSequence text);
++    }
++
++    public static class PendingGroup {
++        public final long id;
++        public final long dialogId;
++        /* the text exactly as it stood in the composer, kept for Undo */
++        public final CharSequence text;
++        private final CharSequence textRef;
++        private final long deadline;
++        private final ArrayList<SendMessagesHelper.SendMessageParams> parts = new ArrayList<>();
++        private Runnable expireRunnable;
++
++        private PendingGroup(long id, long dialogId, CharSequence text, CharSequence textRef, long deadline) {
++            this.id = id;
++            this.dialogId = dialogId;
++            this.text = text;
++            this.textRef = textRef;
++            this.deadline = deadline;
++        }
++
++        public int secondsLeft() {
++            long left = deadline - SystemClock.uptimeMillis();
++            if (left <= 0) {
++                return 0;
++            }
++            return (int) ((left + 999) / 1000);
++        }
++    }
++
++    private final int currentAccount;
++    private final ArrayList<PendingGroup> groups = new ArrayList<>();
++    private final ArrayList<WeakReference<Listener>> listeners = new ArrayList<>();
++    private long nextId = 1;
++
++    private GraceSend(int num) {
++        currentAccount = num;
++    }
++
++    public static boolean isEnabled() {
++        return MessagesController.getGlobalMainSettings().getBoolean(PREF_KEY, true);
++    }
++
++    public void addListener(Listener listener) {
++        for (WeakReference<Listener> ref : listeners) {
++            if (ref.get() == listener) {
++                return;
++            }
++        }
++        listeners.add(new WeakReference<>(listener));
++    }
++
++    /*
++     * Try to hold a fully-built send for the grace window.
++     * Returns true when the send was held (the caller must NOT dispatch it),
++     * false when the caller should send immediately as usual.
++     * Scheduled sends and paid (stars) sends are never held.
++     * All calls happen on the UI thread.
++     */
++    public boolean hold(long dialogId, SendMessagesHelper.SendMessageParams params, CharSequence fullText) {
++        if (!isEnabled() || params == null || fullText == null) {
++            return false;
++        }
++        if (params.scheduleDate != 0 || params.payStars > 0) {
++            return false;
++        }
++        PendingGroup group = null;
++        if (!groups.isEmpty()) {
++            PendingGroup last = groups.get(groups.size() - 1);
++            if (last.dialogId == dialogId && last.textRef == fullText) {
++                // one more part of the same long message, split by the caller
++                group = last;
++            }
++        }
++        if (group == null) {
++            group = new PendingGroup(nextId++, dialogId, new SpannableStringBuilder(fullText), fullText,
++                    SystemClock.uptimeMillis() + DELAY_SECONDS * 1000L);
++            final PendingGroup g = group;
++            group.expireRunnable = () -> expire(g);
++            AndroidUtilities.runOnUIThread(group.expireRunnable, DELAY_SECONDS * 1000L);
++            groups.add(group);
++        }
++        group.parts.add(params);
++        notifyChanged(dialogId);
++        return true;
++    }
++
++    public PendingGroup getEarliest(long dialogId) {
++        PendingGroup best = null;
++        for (PendingGroup group : groups) {
++            if (group.dialogId == dialogId && (best == null || group.deadline < best.deadline)) {
++                best = group;
++            }
++        }
++        return best;
++    }
++
++    public void undo(long groupId) {
++        PendingGroup group = null;
++        for (PendingGroup g : groups) {
++            if (g.id == groupId) {
++                group = g;
++                break;
++            }
++        }
++        if (group == null) {
++            return;
++        }
++        AndroidUtilities.cancelRunOnUIThread(group.expireRunnable);
++        groups.remove(group);
++        // the params are simply dropped: nothing was ever dispatched
++        notifyChanged(group.dialogId);
++        for (Listener listener : aliveListeners()) {
++            listener.onGraceSendUndo(group.dialogId, group.text);
++        }
++    }
++
++    private void expire(PendingGroup group) {
++        if (!groups.remove(group)) {
++            return;
++        }
++        for (SendMessagesHelper.SendMessageParams params : group.parts) {
++            SendMessagesHelper.getInstance(currentAccount).sendMessage(params);
++        }
++        notifyChanged(group.dialogId);
++    }
++
++    private void notifyChanged(long dialogId) {
++        for (Listener listener : aliveListeners()) {
++            listener.onGraceSendChanged(dialogId);
++        }
++    }
++
++    private ArrayList<Listener> aliveListeners() {
++        ArrayList<Listener> alive = new ArrayList<>();
++        Iterator<WeakReference<Listener>> it = listeners.iterator();
++        while (it.hasNext()) {
++            Listener listener = it.next().get();
++            if (listener == null) {
++                it.remove();
++            } else {
++                alive.add(listener);
++            }
++        }
++        return alive;
++    }
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java
+index 266e570..980265c 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/ChatActivityEnterView.java
+@@ -143,6 +143,7 @@ import org.telegram.messenger.MessagesStorage;
+ import org.telegram.messenger.NotificationCenter;
+ import org.telegram.messenger.NotificationsController;
+ import org.telegram.messenger.R;
++import org.telegram.messenger.GraceSend;
+ import org.telegram.messenger.SendMessagesHelper;
+ import org.telegram.messenger.SharedConfig;
+ import org.telegram.messenger.SharedPrefsHelper;
+@@ -7993,7 +7994,9 @@ public class ChatActivityEnterView extends FrameLayout implements
+                     setWebPage(null, true);
+                     parentFragment.fallbackFieldPanel();
+                 }
+-                SendMessagesHelper.getInstance(currentAccount).sendMessage(params);
++                if (!tryGraceSend(params, text)) {
++                    SendMessagesHelper.getInstance(currentAccount).sendMessage(params);
++                }
+                 start = end + 1;
+             } while (end != text.length());
+             return true;
+@@ -8001,6 +8004,89 @@ public class ChatActivityEnterView extends FrameLayout implements
+         return false;
+     }
+ 
++    //region Grace Send (feature patch: 10-second undo window for sends)
++
++    private GraceSendBar graceSendBar;
++    private long graceSendBarGroupId = -1;
++    private boolean graceSendListening;
++
++    private final Runnable graceSendTickRunnable = new Runnable() {
++        @Override
++        public void run() {
++            updateGraceSendBar();
++        }
++    };
++
++    private final GraceSend.Listener graceSendListener = new GraceSend.Listener() {
++        @Override
++        public void onGraceSendChanged(long dialogId) {
++            if (dialogId == dialog_id) {
++                updateGraceSendBar();
++            }
++        }
++
++        @Override
++        public void onGraceSendUndo(long dialogId, CharSequence text) {
++            if (dialogId == dialog_id && editingMessageObject == null && messageEditText != null && TextUtils.isEmpty(messageEditText.getText())) {
++                setFieldText(text);
++            }
++        }
++    };
++
++    /*
++     * Grace Send hook: offer the fully-built params to the grace window
++     * instead of dispatching them right away. Edits, sends attached to a
++     * forward, and schedule-mode sends always go out immediately.
++     */
++    private boolean tryGraceSend(SendMessagesHelper.SendMessageParams params, CharSequence fullText) {
++        if (editingMessageObject != null || isInScheduleMode()) {
++            return false;
++        }
++        if (delegate != null && delegate.hasForwardingMessages()) {
++            return false;
++        }
++        if (!graceSendListening) {
++            graceSendListening = true;
++            GraceSend.getInstance(currentAccount).addListener(graceSendListener);
++        }
++        return GraceSend.getInstance(currentAccount).hold(dialog_id, params, fullText);
++    }
++
++    private void updateGraceSendBar() {
++        GraceSend.PendingGroup group = GraceSend.getInstance(currentAccount).getEarliest(dialog_id);
++        if (group == null) {
++            if (graceSendBar != null) {
++                graceSendBar.setVisibility(GONE);
++            }
++            AndroidUtilities.cancelRunOnUIThread(graceSendTickRunnable);
++            graceSendBarGroupId = -1;
++            return;
++        }
++        if (graceSendBar == null) {
++            graceSendBar = new GraceSendBar(getContext(), resourcesProvider);
++            graceSendBar.setUndoAction(() -> {
++                if (graceSendBarGroupId != -1) {
++                    GraceSend.getInstance(currentAccount).undo(graceSendBarGroupId);
++                }
++            });
++        }
++        graceSendBarGroupId = group.id;
++        ViewGroup parent = (ViewGroup) getParent();
++        if (parent != null && graceSendBar.getParent() != parent) {
++            parent.addView(graceSendBar, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 38, Gravity.LEFT | Gravity.BOTTOM, 7, 0, 7, 0));
++        }
++        ViewGroup.MarginLayoutParams layoutParams = (ViewGroup.MarginLayoutParams) graceSendBar.getLayoutParams();
++        if (layoutParams != null) {
++            layoutParams.bottomMargin = getHeight() + AndroidUtilities.dp(6);
++        }
++        graceSendBar.setCountdown(group.secondsLeft());
++        graceSendBar.setVisibility(VISIBLE);
++        AndroidUtilities.cancelRunOnUIThread(graceSendTickRunnable);
++        AndroidUtilities.runOnUIThread(graceSendTickRunnable, 200);
++    }
++
++    //endregion
++
+     public long getSendMonoForumPeerId() {
+         return parentFragment != null ? parentFragment.getSendMonoForumPeerId() : 0;
+     }
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/Components/GraceSendBar.java b/TMessagesProj/src/main/java/org/telegram/ui/Components/GraceSendBar.java
+new file mode 100644
+index 0000000..43c9332
+--- /dev/null
++++ b/TMessagesProj/src/main/java/org/telegram/ui/Components/GraceSendBar.java
+@@ -0,0 +1,62 @@
++/*
++ * Grace Send countdown bar — the slim bar shown above the composer while a
++ * message is inside its 10-second grace window: "Sending in 0:07" + Undo.
++ * Tapping the bar or the Undo label cancels the send.
++ *
++ * Part of the Grace Send feature patch; see org.telegram.messenger.GraceSend.
++ */
++package org.telegram.ui.Components;
++
++import android.content.Context;
++import android.graphics.Typeface;
++import android.util.TypedValue;
++import android.view.Gravity;
++import android.widget.FrameLayout;
++import android.widget.TextView;
++
++import org.telegram.messenger.AndroidUtilities;
++import org.telegram.messenger.LocaleController;
++import org.telegram.messenger.R;
++import org.telegram.ui.ActionBar.Theme;
++
++public class GraceSendBar extends FrameLayout {
++
++    private final TextView labelView;
++    private Runnable undoAction;
++
++    public GraceSendBar(Context context, Theme.ResourcesProvider resourcesProvider) {
++        super(context);
++        setBackground(Theme.createRoundRectDrawable(AndroidUtilities.dp(12), Theme.getColor(Theme.key_chat_messagePanelBackground, resourcesProvider)));
++
++        labelView = new TextView(context);
++        labelView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
++        labelView.setSingleLine(true);
++        labelView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText, resourcesProvider));
++        addView(labelView, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.WRAP_CONTENT, Gravity.LEFT | Gravity.CENTER_VERTICAL, 12, 0, 0, 0));
++
++        TextView undoView = new TextView(context);
++        undoView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 14);
++        undoView.setSingleLine(true);
++        undoView.setTypeface(Typeface.DEFAULT_BOLD);
++        undoView.setText(LocaleController.getString(R.string.Undo));
++        undoView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText, resourcesProvider));
++        undoView.setPadding(AndroidUtilities.dp(12), 0, AndroidUtilities.dp(12), 0);
++        addView(undoView, LayoutHelper.createFrame(LayoutHelper.WRAP_CONTENT, LayoutHelper.MATCH_PARENT, Gravity.RIGHT | Gravity.CENTER_VERTICAL));
++
++        OnClickListener undoClick = v -> {
++            if (undoAction != null) {
++                undoAction.run();
++            }
++        };
++        undoView.setOnClickListener(undoClick);
++        setOnClickListener(undoClick);
++    }
++
++    public void setUndoAction(Runnable undoAction) {
++        this.undoAction = undoAction;
++    }
++
++    public void setCountdown(int seconds) {
++        labelView.setText(LocaleController.formatString(R.string.GraceSendSendingIn, seconds));
++    }
++}
+diff --git a/TMessagesProj/src/main/java/org/telegram/ui/ThemeActivity.java b/TMessagesProj/src/main/java/org/telegram/ui/ThemeActivity.java
+index c964b54..5609278 100644
+--- a/TMessagesProj/src/main/java/org/telegram/ui/ThemeActivity.java
++++ b/TMessagesProj/src/main/java/org/telegram/ui/ThemeActivity.java
+@@ -165,6 +165,7 @@ public class ThemeActivity extends BaseFragment implements NotificationCenter.No
+     private int raiseToListenRow;
+     private int nextMediaTapRow;
+     private int sendByEnterRow;
++    private int graceSendRow;
+     private int saveToGalleryOption1Row;
+     private int saveToGalleryOption2Row;
+     private int saveToGallerySectionRow;
+@@ -696,6 +697,7 @@ public class ThemeActivity extends BaseFragment implements NotificationCenter.No
+         raiseToListenRow = -1;
+         nextMediaTapRow = -1;
+         sendByEnterRow = -1;
++        graceSendRow = -1;
+         saveToGalleryOption1Row = -1;
+         saveToGalleryOption2Row = -1;
+         saveToGallerySectionRow = -1;
+@@ -810,6 +812,7 @@ public class ThemeActivity extends BaseFragment implements NotificationCenter.No
+                 sensitiveContentRow = rowCount++;
+             }
+             sendByEnterRow = rowCount++;
++            graceSendRow = rowCount++;
+             distanceRow = rowCount++;
+             otherSectionRow = rowCount++;
+         } else {
+@@ -1237,6 +1240,15 @@ public class ThemeActivity extends BaseFragment implements NotificationCenter.No
+                 if (view instanceof TextCheckCell) {
+                     ((TextCheckCell) view).setChecked(!send);
+                 }
++            } else if (position == graceSendRow) {
++                SharedPreferences preferences = MessagesController.getGlobalMainSettings();
++                boolean grace = preferences.getBoolean("grace_send", true);
++                SharedPreferences.Editor editor = preferences.edit();
++                editor.putBoolean("grace_send", !grace);
++                editor.commit();
++                if (view instanceof TextCheckCell) {
++                    ((TextCheckCell) view).setChecked(!grace);
++                }
+             } else if (position == raiseToSpeakRow) {
+                 SharedConfig.toggleRaiseToSpeak();
+                 if (view instanceof TextCheckCell) {
+@@ -2714,6 +2726,9 @@ public class ThemeActivity extends BaseFragment implements NotificationCenter.No
+                     } else if (position == sendByEnterRow) {
+                         SharedPreferences preferences = MessagesController.getGlobalMainSettings();
+                         textCheckCell.setTextAndCheck(getString("SendByEnter", R.string.SendByEnter), preferences.getBoolean("send_by_enter", false), true);
++                    } else if (position == graceSendRow) {
++                        SharedPreferences preferences = MessagesController.getGlobalMainSettings();
++                        textCheckCell.setTextAndValueAndCheck(getString("GraceSend", R.string.GraceSend), getString("GraceSendInfo", R.string.GraceSendInfo), preferences.getBoolean("grace_send", true), true, true);
+                     } else if (position == raiseToSpeakRow) {
+                         textCheckCell.setTextAndValueAndCheck(getString("RaiseToSpeak", R.string.RaiseToSpeak), getString("RaiseToSpeakInfo", R.string.RaiseToSpeakInfo), SharedConfig.raiseToSpeak, true, true);
+                     } else if (position == raiseToListenRow) {
+@@ -2861,7 +2876,7 @@ public class ThemeActivity extends BaseFragment implements NotificationCenter.No
+                 return TYPE_HEADER;
+             } else if (position == automaticBrightnessRow) {
+                 return TYPE_BRIGHTNESS;
+-            } else if (position == scheduleLocationRow || position == sendByEnterRow ||
++            } else if (position == scheduleLocationRow || position == sendByEnterRow || position == graceSendRow ||
+                     position == raiseToSpeakRow || position == raiseToListenRow || position == pauseOnRecordRow ||
+                     position == directShareRow || position == chatBlurRow || position == pauseOnMediaRow || position == nextMediaTapRow || position == sensitiveContentRow) {
+                 return TYPE_TEXT_CHECK;
+diff --git a/TMessagesProj/src/main/res/values/strings.xml b/TMessagesProj/src/main/res/values/strings.xml
+index e4f8cf6..e7c7b8f 100644
+--- a/TMessagesProj/src/main/res/values/strings.xml
++++ b/TMessagesProj/src/main/res/values/strings.xml
+@@ -2462,6 +2462,9 @@
+     <string name="SetColor">Set a color</string>
+     <string name="MessagesSettings">Messages</string>
+     <string name="SendByEnter">Send by Enter</string>
++    <string name="GraceSend">Grace Send</string>
++    <string name="GraceSendInfo">Wait 10 seconds before sending, with a chance to undo</string>
++    <string name="GraceSendSendingIn">Sending in 0:%02d</string>
+     <string name="Events">Events</string>
+     <string name="ContactJoined">Contact joined Telegram</string>
+     <string name="PinnedMessages">Pinned Messages</string>
